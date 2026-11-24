@@ -158,6 +158,7 @@ def run_inference(
     vanilla_attn: bool = False,
     dataset_name: str = "unknown",
     enable_torch_profiler: bool = False,
+    ignore_eos: bool = False,
 ):
     # Ensure logging is configured for library use
     if not logging.getLogger().hasHandlers():
@@ -296,6 +297,10 @@ def run_inference(
         "num_sink_tokens": 4,
         "max_batch_size": max_batch_size,
     }
+    if ignore_eos:
+        # GRASS: every request runs to its desired output length (bounded by clip_length).
+        # Used for timing runs and for replaying recorded response lengths.
+        job_args["eos_token_id"] = []
     logger.info(f"eos_token_id: {job_args['eos_token_id']}")
 
     # Below this point, actual model is created.
@@ -633,6 +638,11 @@ if __name__ == "__main__":
     argparser.add_argument("--debug", action="store_true", help="Transformer")
     argparser.add_argument("--vanilla-attn", action="store_true")
     argparser.add_argument("--enable-torch-profiler", action="store_true")
+    argparser.add_argument(
+        "--ignore_eos",
+        action="store_true",
+        help="Do not stop at EOS; every request runs to its desired output length",
+    )
     args = argparser.parse_args()
 
     assert args.admit_policy != "naive" or args.kv_cache == "full"
@@ -679,4 +689,5 @@ if __name__ == "__main__":
         vanilla_attn=args.vanilla_attn,
         dataset_name=args.dataset_name,
         enable_torch_profiler=args.enable_torch_profiler,
+        ignore_eos=args.ignore_eos,
     )

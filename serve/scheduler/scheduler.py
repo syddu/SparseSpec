@@ -10,6 +10,7 @@ from serve.model.model import KVPool
 from serve.profiler import Profiler
 from serve.request.request import Request
 from serve.sampling.sampler import Sampler, SamplingMetadata
+from serve.scheduler.iter_log import IterLog
 from serve.utils import (
     get_local_rank,
     index_copy,
@@ -532,6 +533,8 @@ class BaseScheduler:
             request.request_id = idx
 
         _timestamp = time.perf_counter()
+        # GRASS: per-iteration log, None unless GRASS_ITER_LOG names a file (see iter_log.py)
+        iter_log = IterLog.from_env() if is_first_rank() else None
 
         # For async, the generated token ids tensor from the previous forward pass
         last_gen_token_ids_tensor = None
@@ -541,9 +544,13 @@ class BaseScheduler:
         pbar = tqdm(total=total_requests, desc="Specgen inference")
         while pending_requests or self.active_requests or self.offload_requests:
             # Admit new requests
+            if iter_log is not None:
+                iter_log.mark("t_start")
             nvtx.range_push("Admit requests")
             self.admit_requests(pending_requests)
             nvtx.range_pop()
+            if iter_log is not None:
+                iter_log.mark("t_admit")
 
             assert (
                 len(self.active_requests)
@@ -556,6 +563,19 @@ class BaseScheduler:
             nvtx.range_push("Prepare forward inputs")
             input_metadata, input_metadata_tensors = self.prepare_forward_inputs()
             nvtx.range_pop()
+            if iter_log is not None:
+                try:
+                    iter_log.snapshot(
+                        self,
+                        input_metadata,
+                        len(pending_requests),
+                        len(completed_requests),
+                    )
+                    iter_log.mark("t_prepare")
+                except Exception:
+                    # keep the run alive; the missing log file tells the caller
+                    logger.exception("GRASS iteration log switched off after an error")
+                    iter_log = None
 
             if input_metadata is not None:
                 # Feed in input metadata if input_metadata is not None
@@ -641,6 +661,8 @@ class BaseScheduler:
                 # syncronize previous run
                 # as input is None, no need for another kernel launch
                 stream_forward.synchronize()
+            if iter_log is not None:
+                iter_log.mark("t_forward")
 
             nvtx.range_push("Update requests")
             # NOTE (Yilong): Here we got the output from the last iter
@@ -669,6 +691,8 @@ class BaseScheduler:
             output_snapshot_barrier = torch.cuda.current_stream().record_event()
             self.model.kv_cache.step()  # flip phase
             nvtx.range_pop()
+            if iter_log is not None:
+                iter_log.mark("t_update")
 
             nvtx.range_push("Log throughput metrics")
             # torch-profiler
@@ -690,8 +714,38 @@ class BaseScheduler:
             wandb_logger.step()
             self.log_refresh_metrics()  # refresh step-specific metrics
             nvtx.range_pop()
+            if iter_log is not None:
+                iter_log.set_spec_counters(
+                    wandb_logger.log_data.get("spec/total_speculative_tokens", 0),
+                    wandb_logger.log_data.get("spec/accepted_speculative_tokens", 0),
+                )
+                iter_log.mark("t_end")
+                iter_log.commit()
 
         pbar.close()
+        if iter_log is not None:
+            # A failure to write the log must not lose the run itself; the caller checks the file.
+            try:
+                _bsz = getattr(self.model, "captured_bsz", None)
+                iter_log.save(
+                    {
+                        "scheduler": type(self).__name__,
+                        "num_requests": total_requests,
+                        "args": {
+                            k: v
+                            for k, v in self._args.items()
+                            if isinstance(v, (int, float, str, bool, list, type(None)))
+                        },
+                        "kv_capacity_pages": self.kv_pool.capacity,
+                        "page_size": self.kv_pool.page_size,
+                        "captured_bsz": [] if _bsz is None else [int(x) for x in _bsz],
+                    }
+                )
+                logger.info(
+                    f"GRASS iteration log: {len(iter_log)} rows written to {iter_log.path}"
+                )
+            except Exception:
+                logger.exception("GRASS iteration log could not be written")
         # Sort completed requests by request_id
         completed_requests.sort(key=lambda x: x.request_id)
 
