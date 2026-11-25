@@ -1,5 +1,6 @@
 import array
 import math
+import os
 
 import flashinfer
 import numpy as np
@@ -18,7 +19,11 @@ from serve.request.request import Request
 class PillarCachePtr(StreamingCachePtr):
     # these constants are used for jit compile
     MAX_TOTAL_DRAFT_KV_LEN = 128 * 1024
-    MAX_TOTAL_VERIFY_KV_LEN = 256 * 1024
+    # GRASS: KV tokens of all requests that verify in one iteration together. The kernel writes
+    # past its buffer when this is exceeded (CUDA illegal memory access). With mixed phases about
+    # 1/(k+2) of the batch verifies at once; with batch_policy "step" all of it does, so the limit
+    # must cover the whole KV pool. GRASS_MAX_VERIFY_KV sets it (default: the authors' 256K).
+    MAX_TOTAL_VERIFY_KV_LEN = int(os.environ.get("GRASS_MAX_VERIFY_KV", 256 * 1024))
     MAX_LEN_SELECTED_KV_CACHE = 6 * 1024
     MAX_SPEC_STRIDE = 16
     NUM_QO_HEADS = 1
@@ -366,6 +371,18 @@ class PillarCachePtr(StreamingCachePtr):
             else:
                 verify_kv_indptr_host.append(dump_logits_len)
         nvtx.range_pop()
+
+        # GRASS: fail with a message instead of a CUDA fault (asserts are stripped by -O)
+        if dump_logits_len >= cls.MAX_TOTAL_VERIFY_KV_LEN:
+            raise RuntimeError(
+                f"KV tokens of verifying requests ({dump_logits_len}) reach the verify buffer "
+                f"({cls.MAX_TOTAL_VERIFY_KV_LEN}); raise GRASS_MAX_VERIFY_KV"
+            )
+        if flatten_indices_len >= cls.MAX_TOTAL_DRAFT_KV_LEN:
+            raise RuntimeError(
+                f"KV tokens of drafting requests ({flatten_indices_len}) reach the draft buffer "
+                f"({cls.MAX_TOTAL_DRAFT_KV_LEN})"
+            )
 
         # append the last element to align w/ StreamingCachePtr
         kv_indptr_host.append(
