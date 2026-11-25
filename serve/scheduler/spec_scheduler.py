@@ -296,6 +296,11 @@ class SpecScheduler(BaseScheduler):
         selected_indices_metadata = request.kv_cache_ptr.get_select_metadata(**kwargs)
         selected_indices_metadata["len_kv_indices"] = request.kv_cache_ptr.len_kv_cache
 
+        # GRASS: per-request record (plain appends, no GPU work)
+        request.grass_drafted.append(spec_tokens_count)
+        request.grass_accepted.append(accepted_tokens - 1)
+        request.grass_verify_iter.append(getattr(self, "grass_iter", -1))
+
         # log Specgen metrics
         self.log_throughput_metrics(
             spec_tokens_count, accepted_tokens - 1, accepted_tokens

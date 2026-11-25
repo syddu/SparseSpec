@@ -568,6 +568,7 @@ class BaseScheduler:
         last_gen_input_metadata = None
         output_snapshot_barrier = None
         pbar = tqdm(total=total_requests, desc="Specgen inference")
+        self.grass_iter = 0  # GRASS: iteration index for the per-request record
         while pending_requests or self.active_requests or self.offload_requests:
             # Admit new requests
             if iter_log is not None:
@@ -709,6 +710,8 @@ class BaseScheduler:
                 ),
                 last_gen_input_metadata if self.async_on else input_metadata,
             )
+            for _req in newly_completed_requests:
+                _req.grass_done_iter = self.grass_iter
             completed_requests.extend(newly_completed_requests)
 
             last_gen_token_ids_tensor = gen_token_ids_tensor
@@ -740,6 +743,7 @@ class BaseScheduler:
             wandb_logger.step()
             self.log_refresh_metrics()  # refresh step-specific metrics
             nvtx.range_pop()
+            self.grass_iter += 1
             if iter_log is not None:
                 iter_log.set_spec_counters(
                     wandb_logger.log_data.get("spec/total_speculative_tokens", 0),

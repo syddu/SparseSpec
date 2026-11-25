@@ -28,6 +28,16 @@ from serve.utils import *
 logger = logging.getLogger(__name__)
 
 
+def _grass_spec_record(req) -> dict:
+    """GRASS: drafted and accepted tokens per verified cycle, iteration of each verify, finish iteration."""
+    return {
+        "spec_drafted": list(getattr(req, "grass_drafted", [])),
+        "spec_accepted": list(getattr(req, "grass_accepted", [])),
+        "spec_verify_iter": list(getattr(req, "grass_verify_iter", [])),
+        "done_iter": getattr(req, "grass_done_iter", None),
+    }
+
+
 def dispatch_str_to_cache_ptr(kv_cache: str):
     if kv_cache == "full":
         return FullCachePtr
@@ -533,6 +543,8 @@ def run_inference(
                         "len_input": req.len_input,
                         "len_output": len(req.token_ids) - req.len_input,
                         "output_token_ids": list(req.token_ids[req.len_input :]),
+                        # GRASS: per-request speculation record (empty for plain decoding)
+                        **_grass_spec_record(req),
                         # following is expected by math_eval.py
                         "tokens": full_tokens,
                         "generated_tokens": output_tokens,
@@ -556,6 +568,8 @@ def run_inference(
                     "len_output": len(req.token_ids) - req.len_input,
                     "output_token_ids": list(req.token_ids[req.len_input :]),
                     "id": req.request_id,
+                    # GRASS: per-request speculation record (empty for plain decoding)
+                    **_grass_spec_record(req),
                     # Add format expected by math_eval.py
                     "tokens": full_tokens,
                     "generated_tokens": output_tokens,
