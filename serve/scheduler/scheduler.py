@@ -11,6 +11,7 @@ from serve.profiler import Profiler
 from serve.request.request import Request
 from serve.sampling.sampler import Sampler, SamplingMetadata
 from serve.scheduler.iter_log import IterLog
+from serve.scheduler import step_policy
 from serve.utils import (
     get_local_rank,
     index_copy,
@@ -47,6 +48,9 @@ class BaseScheduler:
         self.admit_policy = kwargs["admit_policy"]
         self.async_on = kwargs["async_cpu"]
         self._args = kwargs
+        # GRASS: batch_policy "step" keeps all speculation cycles in step (see step_policy.py)
+        self.step_policy = kwargs.get("batch_policy") == "step"
+        self.step_wait_iterations = 0  # request-iterations spent waiting for the common phase
 
         # construct sampler
         self.sampler = Sampler(tp_ranks=kwargs["tp_ranks"])
@@ -193,6 +197,13 @@ class BaseScheduler:
                     break
 
         elif self.admit_policy == "offloading":
+            if self.step_policy:
+                self.step_wait_iterations += step_policy.keep_in_step(
+                    self.active_requests,
+                    self.offload_requests,
+                    self.max_batch_size,
+                    self._args.get("spec_stride", 0),
+                )
             # Do not include chunk size here to leave headroom
             tokens_needed_sum = sum(
                 req.len_token_ids - req.len_kv_cache for req in self.active_requests
@@ -229,6 +240,10 @@ class BaseScheduler:
                                 continue
                             request = req
                             break
+                        if request is None and self.step_policy:
+                            # GRASS: every active request waits for its verify result. None of
+                            # them allocates KV in this iteration, so nothing has to leave now.
+                            break
                         assert request is not None
 
                         self.offloading_request = request.offload()
@@ -246,17 +261,28 @@ class BaseScheduler:
             else:
                 # If there are offloaded requests, try to restore them
                 nvtx.range_push("Restore offloaded requests")
+                # GRASS: a request that waits for the common phase (step_policy.py) is in
+                # `offload_requests` with all its KV on the GPU. It is not restored again and
+                # counts as active for the batch size. Without batch_policy "step" nothing waits.
+                _offloaded = [
+                    r for r in self.offload_requests if not step_policy.is_waiting(r)
+                ]
+                _num_waiting = len(self.offload_requests) - len(_offloaded)
                 if (
-                    len(self.offload_requests) > 0
-                    and len(self.active_requests) < self.max_batch_size
-                    and self.offload_requests[-1].MAX_OFFLOADING_LEN
-                    < available_capacity
+                    len(_offloaded) > 0
+                    and len(self.active_requests) + _num_waiting < self.max_batch_size
+                    and _offloaded[-1].MAX_OFFLOADING_LEN < available_capacity
                 ):
-                    request = self.offload_requests[-1]
+                    request = _offloaded[-1]
                     self.offloading_request = request.restore()
                     if self.offloading_request is None:
-                        self.add_request(request, is_restore=True)
-                        self.offload_requests.pop()
+                        if self.step_policy and not step_policy.try_join(
+                            request, step_policy.target_phase(self.active_requests)
+                        ):
+                            request.restore_wait = 0  # rejoins in keep_in_step
+                        else:
+                            self.add_request(request, is_restore=True)
+                            self.offload_requests.remove(request)
 
                     available_capacity = (
                         self.kv_pool.num_free_pages * self.kv_pool.page_size

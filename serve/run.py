@@ -614,7 +614,7 @@ if __name__ == "__main__":
         "--batch_policy",
         type=str,
         default="random",
-        choices=["naive", "random", "greedy"],
+        choices=["naive", "random", "greedy", "step"],
     )
     argparser.add_argument(
         "--chunk_size", type=int, default=16 * 1024, help="chunked prefill"
