@@ -170,6 +170,9 @@ class BatchTopKAttention(BatchAttention):
             f"_head_dim_{head_dim}"
             f"_spec_stride_{MAX_SPEC_STRIDE}"
             f"_draft_kv_len_{MAX_TOTAL_DRAFT_KV_LEN}"
+            # GRASS: the core kernel's dump_logits offset depends on this constant too; without it
+            # in the name a changed value would load a kernel compiled for the old one
+            f"_verify_kv_len_{MAX_TOTAL_VERIFY_KV_LEN}"
         )
         jit_args = [
             uri,  # uri
