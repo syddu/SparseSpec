@@ -87,6 +87,9 @@ class SpecScheduler(BaseScheduler):
                 _max_idx = (np.argmax(_bucket_hist) + 1) % (self.spec_stride + 1)
                 assert _max_idx != self.spec_stride
                 request.cur_spec_idx = _max_idx
+            elif self._args["batch_policy"] == "step":
+                # GRASS: the index is set when the request starts its first cycle (step_policy.py)
+                request.cur_spec_idx = 0
             else:
                 raise ValueError(f"Unknown batch policy: {self._args['batch_policy']}")
             request.initial_idx = request.cur_spec_idx
@@ -292,6 +295,11 @@ class SpecScheduler(BaseScheduler):
         kwargs["num_accepted_tokens"] = accepted_tokens
         selected_indices_metadata = request.kv_cache_ptr.get_select_metadata(**kwargs)
         selected_indices_metadata["len_kv_indices"] = request.kv_cache_ptr.len_kv_cache
+
+        # GRASS: per-request record (plain appends, no GPU work)
+        request.grass_drafted.append(spec_tokens_count)
+        request.grass_accepted.append(accepted_tokens - 1)
+        request.grass_verify_iter.append(getattr(self, "grass_iter", -1))
 
         # log Specgen metrics
         self.log_throughput_metrics(

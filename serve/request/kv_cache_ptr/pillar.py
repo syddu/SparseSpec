@@ -1,5 +1,6 @@
 import array
 import math
+import os
 
 import flashinfer
 import numpy as np
@@ -18,7 +19,11 @@ from serve.request.request import Request
 class PillarCachePtr(StreamingCachePtr):
     # these constants are used for jit compile
     MAX_TOTAL_DRAFT_KV_LEN = 128 * 1024
-    MAX_TOTAL_VERIFY_KV_LEN = 256 * 1024
+    # GRASS: KV tokens of all requests that verify in one iteration together. The kernel writes
+    # past its buffer when this is exceeded (CUDA illegal memory access). With mixed phases about
+    # 1/(k+2) of the batch verifies at once; with batch_policy "step" all of it does, so the limit
+    # must cover the whole KV pool. GRASS_MAX_VERIFY_KV sets it (default: the authors' 256K).
+    MAX_TOTAL_VERIFY_KV_LEN = int(os.environ.get("GRASS_MAX_VERIFY_KV", 256 * 1024))
     MAX_LEN_SELECTED_KV_CACHE = 6 * 1024
     MAX_SPEC_STRIDE = 16
     NUM_QO_HEADS = 1
@@ -367,6 +372,18 @@ class PillarCachePtr(StreamingCachePtr):
                 verify_kv_indptr_host.append(dump_logits_len)
         nvtx.range_pop()
 
+        # GRASS: fail with a message instead of a CUDA fault (asserts are stripped by -O)
+        if dump_logits_len >= cls.MAX_TOTAL_VERIFY_KV_LEN:
+            raise RuntimeError(
+                f"KV tokens of verifying requests ({dump_logits_len}) reach the verify buffer "
+                f"({cls.MAX_TOTAL_VERIFY_KV_LEN}); raise GRASS_MAX_VERIFY_KV"
+            )
+        if flatten_indices_len >= cls.MAX_TOTAL_DRAFT_KV_LEN:
+            raise RuntimeError(
+                f"KV tokens of drafting requests ({flatten_indices_len}) reach the draft buffer "
+                f"({cls.MAX_TOTAL_DRAFT_KV_LEN})"
+            )
+
         # append the last element to align w/ StreamingCachePtr
         kv_indptr_host.append(
             kv_indptr_host[-1] + active_requests[-1].len_loading_kv_cache
@@ -496,29 +513,37 @@ class PillarCachePtr(StreamingCachePtr):
         )
 
         # call kernel
-        _, out_idx = topk_wrapper.run(
-            in_val=dump_logits,
-            in_idx=all_kv_indices_gpu,
-            in_val_start_pos=in_val_start_pos,
-            in_idx_start_pos=in_idx_start_pos,
-            in_lens=in_lens,
-            ks=ks,
-            num_requests=num_verify_requests,
-        )
+        # GRASS: in chunks of verifying requests. The top-k scratch is two tensors of
+        # [requests, layers * kv_heads, MAX_LEN_SELECTED_KV_CACHE] (about 8 MiB per request with
+        # Qwen3-1.7B). With mixed phases about 1/(k+2) of the batch verifies at once; with
+        # batch_policy "step" all of it does (1 GiB at 128 requests, which ran out of memory).
+        chunk = int(os.environ.get("GRASS_TOPK_CHUNK", 16))
+        for lo in range(0, num_verify_requests, chunk):
+            hi = min(lo + chunk, num_verify_requests)
+            _, out_idx = topk_wrapper.run(
+                in_val=dump_logits,
+                in_idx=all_kv_indices_gpu,
+                in_val_start_pos=in_val_start_pos[lo:hi],
+                in_idx_start_pos=in_idx_start_pos[lo:hi],
+                in_lens=in_lens[lo:hi],
+                ks=ks[lo:hi],
+                num_requests=hi - lo,
+            )
 
-        # step 2. update selected indices
-        assert out_idx.shape[-1] == cls.MAX_LEN_SELECTED_KV_CACHE
-        grid = (
-            cls.NUM_LAYERS * cls.NUM_KV_HEADS,
-            num_verify_requests,
-            1,
-        )
-        cls.update_selected_indices_kernel[grid](
-            out_idx,
-            ks,
-            selected_indices_ptrs,
-            cls.MAX_LEN_SELECTED_KV_CACHE,
-        )
+            # step 2. update selected indices
+            assert out_idx.shape[-1] == cls.MAX_LEN_SELECTED_KV_CACHE
+            grid = (
+                cls.NUM_LAYERS * cls.NUM_KV_HEADS,
+                hi - lo,
+                1,
+            )
+            cls.update_selected_indices_kernel[grid](
+                out_idx,
+                ks[lo:hi],
+                selected_indices_ptrs[lo:hi],
+                cls.MAX_LEN_SELECTED_KV_CACHE,
+            )
+            del out_idx
 
     @staticmethod
     def concat_selected_indices(

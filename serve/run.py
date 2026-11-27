@@ -28,6 +28,16 @@ from serve.utils import *
 logger = logging.getLogger(__name__)
 
 
+def _grass_spec_record(req) -> dict:
+    """GRASS: drafted and accepted tokens per verified cycle, iteration of each verify, finish iteration."""
+    return {
+        "spec_drafted": list(getattr(req, "grass_drafted", [])),
+        "spec_accepted": list(getattr(req, "grass_accepted", [])),
+        "spec_verify_iter": list(getattr(req, "grass_verify_iter", [])),
+        "done_iter": getattr(req, "grass_done_iter", None),
+    }
+
+
 def dispatch_str_to_cache_ptr(kv_cache: str):
     if kv_cache == "full":
         return FullCachePtr
@@ -158,6 +168,7 @@ def run_inference(
     vanilla_attn: bool = False,
     dataset_name: str = "unknown",
     enable_torch_profiler: bool = False,
+    ignore_eos: bool = False,
 ):
     # Ensure logging is configured for library use
     if not logging.getLogger().hasHandlers():
@@ -296,6 +307,10 @@ def run_inference(
         "num_sink_tokens": 4,
         "max_batch_size": max_batch_size,
     }
+    if ignore_eos:
+        # GRASS: every request runs to its desired output length (bounded by clip_length).
+        # Used for timing runs and for replaying recorded response lengths.
+        job_args["eos_token_id"] = []
     logger.info(f"eos_token_id: {job_args['eos_token_id']}")
 
     # Below this point, actual model is created.
@@ -528,6 +543,8 @@ def run_inference(
                         "len_input": req.len_input,
                         "len_output": len(req.token_ids) - req.len_input,
                         "output_token_ids": list(req.token_ids[req.len_input :]),
+                        # GRASS: per-request speculation record (empty for plain decoding)
+                        **_grass_spec_record(req),
                         # following is expected by math_eval.py
                         "tokens": full_tokens,
                         "generated_tokens": output_tokens,
@@ -551,6 +568,8 @@ def run_inference(
                     "len_output": len(req.token_ids) - req.len_input,
                     "output_token_ids": list(req.token_ids[req.len_input :]),
                     "id": req.request_id,
+                    # GRASS: per-request speculation record (empty for plain decoding)
+                    **_grass_spec_record(req),
                     # Add format expected by math_eval.py
                     "tokens": full_tokens,
                     "generated_tokens": output_tokens,
@@ -609,7 +628,7 @@ if __name__ == "__main__":
         "--batch_policy",
         type=str,
         default="random",
-        choices=["naive", "random", "greedy"],
+        choices=["naive", "random", "greedy", "step"],
     )
     argparser.add_argument(
         "--chunk_size", type=int, default=16 * 1024, help="chunked prefill"
@@ -633,6 +652,11 @@ if __name__ == "__main__":
     argparser.add_argument("--debug", action="store_true", help="Transformer")
     argparser.add_argument("--vanilla-attn", action="store_true")
     argparser.add_argument("--enable-torch-profiler", action="store_true")
+    argparser.add_argument(
+        "--ignore_eos",
+        action="store_true",
+        help="Do not stop at EOS; every request runs to its desired output length",
+    )
     args = argparser.parse_args()
 
     assert args.admit_policy != "naive" or args.kv_cache == "full"
@@ -679,4 +703,5 @@ if __name__ == "__main__":
         vanilla_attn=args.vanilla_attn,
         dataset_name=args.dataset_name,
         enable_torch_profiler=args.enable_torch_profiler,
+        ignore_eos=args.ignore_eos,
     )

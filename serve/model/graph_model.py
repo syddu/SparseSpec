@@ -16,6 +16,7 @@
 
 import contextlib
 import logging
+import os
 from collections import defaultdict
 
 import numpy as np
@@ -101,6 +102,10 @@ class CUDAGraphModelWrapper:
             return x_int_no_dup
 
         captured_args = [1, 2, 4, 8, 16, 32, 64, 128, 256, 384, 512, 640]
+        # GRASS: extra graph sizes, e.g. GRASS_GRAPH_SIZES="768,896" for verify passes of 128
+        # requests in step at draft length 6 (896 query tokens), which otherwise run eagerly
+        _extra = os.environ.get("GRASS_GRAPH_SIZES", "").replace(",", " ").split()
+        captured_args = sorted(set(captured_args) | {int(x) for x in _extra})
         self.capture(captured_args)
 
     @torch.inference_mode()

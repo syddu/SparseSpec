@@ -4,7 +4,6 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
-from serve.distribute.custom_all_reduce import CustomAllreduce
 from serve.distribute.pynccl import PyNcclCommunicator
 from serve.utils import get_local_rank, get_world_size
 
@@ -36,6 +35,10 @@ class CudaCommunicator:
                 self.communicator = PyNcclCommunicator(customized_group, self.device)
                 self.reducer = lambda x: self.communicator.all_reduce(x)
             case "customized":
+                # Imported here, not at module level: custom_all_reduce needs the vLLM fork
+                # (`from vllm import _custom_ops`), which single-GPU runs (tp_ranks=1) never use.
+                from serve.distribute.custom_all_reduce import CustomAllreduce
+
                 ranks = list(range(self.world_size))
                 customized_group = torch.distributed.new_group(ranks, backend="gloo")
                 self.communicator = CustomAllreduce(

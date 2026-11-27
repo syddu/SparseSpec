@@ -66,7 +66,16 @@ class KVPool:
         )
 
         # NOTE(Yilong): This could be super slow on certain machines.
-        self._MAX_CPU_CAPACITY = math.ceil(self.capacity * 1.5)
+        # GRASS: the host store below is pinned memory, by default 1.5 times the GPU pool (the
+        # authors' value). GRASS_HOST_KV_FACTOR changes the factor: smaller for runs that never
+        # offload on cards whose pool is larger than the job's host memory, larger when more KV
+        # is in flight than 2.5 pools.
+        _host_factor = float(os.environ.get("GRASS_HOST_KV_FACTOR", "1.5"))
+        self._MAX_CPU_CAPACITY = max(1, math.ceil(self.capacity * _host_factor))
+        logger.info(
+            f"Host KV store: {self._MAX_CPU_CAPACITY} pages "
+            f"({_host_factor} x GPU pool of {self.capacity}), pinned"
+        )
         self._free_cpu = array.array("i", range(self._MAX_CPU_CAPACITY))
         self._physical_mem_cpu = torch.empty(
             (

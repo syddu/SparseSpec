@@ -39,6 +39,14 @@ class Request:
         self.draft_probs = None
         self.len_draft_probs = 0  # 0-base
 
+        # GRASS: per-request speculation record, one entry per verified cycle
+        # (drafted tokens, accepted drafted tokens, scheduler iteration of the verify result).
+        # Filled by SpecScheduler.verify_outputs; read after the run, never by the scheduler.
+        self.grass_drafted = array.array("B")
+        self.grass_accepted = array.array("B")
+        self.grass_verify_iter = array.array("i")
+        self.grass_done_iter: Optional[int] = None
+
     def attach_kv_pool(self, kv_pool: KVPool):
         """
         Init necessary metadata for this request.
