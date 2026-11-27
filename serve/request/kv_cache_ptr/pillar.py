@@ -513,29 +513,37 @@ class PillarCachePtr(StreamingCachePtr):
         )
 
         # call kernel
-        _, out_idx = topk_wrapper.run(
-            in_val=dump_logits,
-            in_idx=all_kv_indices_gpu,
-            in_val_start_pos=in_val_start_pos,
-            in_idx_start_pos=in_idx_start_pos,
-            in_lens=in_lens,
-            ks=ks,
-            num_requests=num_verify_requests,
-        )
+        # GRASS: in chunks of verifying requests. The top-k scratch is two tensors of
+        # [requests, layers * kv_heads, MAX_LEN_SELECTED_KV_CACHE] (about 8 MiB per request with
+        # Qwen3-1.7B). With mixed phases about 1/(k+2) of the batch verifies at once; with
+        # batch_policy "step" all of it does (1 GiB at 128 requests, which ran out of memory).
+        chunk = int(os.environ.get("GRASS_TOPK_CHUNK", 16))
+        for lo in range(0, num_verify_requests, chunk):
+            hi = min(lo + chunk, num_verify_requests)
+            _, out_idx = topk_wrapper.run(
+                in_val=dump_logits,
+                in_idx=all_kv_indices_gpu,
+                in_val_start_pos=in_val_start_pos[lo:hi],
+                in_idx_start_pos=in_idx_start_pos[lo:hi],
+                in_lens=in_lens[lo:hi],
+                ks=ks[lo:hi],
+                num_requests=hi - lo,
+            )
 
-        # step 2. update selected indices
-        assert out_idx.shape[-1] == cls.MAX_LEN_SELECTED_KV_CACHE
-        grid = (
-            cls.NUM_LAYERS * cls.NUM_KV_HEADS,
-            num_verify_requests,
-            1,
-        )
-        cls.update_selected_indices_kernel[grid](
-            out_idx,
-            ks,
-            selected_indices_ptrs,
-            cls.MAX_LEN_SELECTED_KV_CACHE,
-        )
+            # step 2. update selected indices
+            assert out_idx.shape[-1] == cls.MAX_LEN_SELECTED_KV_CACHE
+            grid = (
+                cls.NUM_LAYERS * cls.NUM_KV_HEADS,
+                hi - lo,
+                1,
+            )
+            cls.update_selected_indices_kernel[grid](
+                out_idx,
+                ks[lo:hi],
+                selected_indices_ptrs[lo:hi],
+                cls.MAX_LEN_SELECTED_KV_CACHE,
+            )
+            del out_idx
 
     @staticmethod
     def concat_selected_indices(
